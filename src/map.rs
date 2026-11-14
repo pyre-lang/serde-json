@@ -1,9 +1,10 @@
 //! A map of String to serde_json::Value.
 //!
-//! By default the map is backed by a [`BTreeMap`]. Enable the `preserve_order`
-//! feature of serde_json to use [`IndexMap`] instead.
+//! By default the map is a [`Vec`] sorted by key ([`vecset::VecMap`]). Enable
+//! the `preserve_order` feature of serde_json to use [`IndexMap`] instead.
 //!
-//! [`BTreeMap`]: std::collections::BTreeMap
+//! [`Vec`]: alloc::vec::Vec
+//! [`vecset::VecMap`]: vecset::VecMap
 //! [`IndexMap`]: indexmap::IndexMap
 
 use crate::error::Error;
@@ -21,7 +22,7 @@ use core::ops;
 use serde::de;
 
 #[cfg(not(feature = "preserve_order"))]
-use alloc::collections::{btree_map, BTreeMap};
+use vecset::{map, VecMap};
 #[cfg(feature = "preserve_order")]
 use indexmap::IndexMap;
 
@@ -31,9 +32,16 @@ pub struct Map<K, V> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type MapImpl<K, V> = BTreeMap<K, V>;
+type MapImpl<K, V> = VecMap<K, V>;
 #[cfg(feature = "preserve_order")]
 type MapImpl<K, V> = IndexMap<K, V>;
+
+#[cfg(not(feature = "preserve_order"))]
+fn reserve_first(map: &mut MapImpl<String, Value>) {
+    if map.is_empty() && map.capacity() == 0 {
+        *map = VecMap::with_capacity(1);
+    }
+}
 
 impl Map<String, Value> {
     /// Makes a new empty Map.
@@ -52,7 +60,7 @@ impl Map<String, Value> {
             map: {
                 // does not support with_capacity
                 let _ = capacity;
-                BTreeMap::new()
+                VecMap::new()
             },
             #[cfg(feature = "preserve_order")]
             map: IndexMap::with_capacity(capacity),
@@ -125,6 +133,8 @@ impl Map<String, Value> {
     /// value is returned.
     #[inline]
     pub fn insert(&mut self, k: String, v: Value) -> Option<Value> {
+        #[cfg(not(feature = "preserve_order"))]
+        reserve_first(&mut self.map);
         self.map.insert(k, v)
     }
 
@@ -266,7 +276,9 @@ impl Map<String, Value> {
         self.map
             .extend(mem::replace(&mut other.map, MapImpl::default()));
         #[cfg(not(feature = "preserve_order"))]
-        self.map.append(&mut other.map);
+        for (k, v) in core::mem::take(&mut other.map) {
+            self.insert(k, v);
+        }
     }
 
     /// Gets the given key's corresponding entry in the map for in-place
@@ -276,9 +288,12 @@ impl Map<String, Value> {
         S: Into<String>,
     {
         #[cfg(not(feature = "preserve_order"))]
-        use alloc::collections::btree_map::Entry as EntryImpl;
+        use vecset::map::Entry as EntryImpl;
         #[cfg(feature = "preserve_order")]
         use indexmap::map::Entry as EntryImpl;
+
+        #[cfg(not(feature = "preserve_order"))]
+        reserve_first(&mut self.map);
 
         match self.map.entry(key.into()) {
             EntryImpl::Vacant(vacant) => Entry::Vacant(VacantEntry { vacant }),
@@ -355,7 +370,24 @@ impl Map<String, Value> {
     where
         F: FnMut(&String, &mut Value) -> bool,
     {
+        #[cfg(feature = "preserve_order")]
         self.map.retain(f);
+        #[cfg(not(feature = "preserve_order"))]
+        {
+            let mut f = f;
+            let mut i = 0;
+            while i < self.map.len() {
+                let keep = match self.map.get_index_mut(i) {
+                    Some((k, v)) => f(k, v),
+                    None => break,
+                };
+                if keep {
+                    i += 1;
+                } else {
+                    self.map.remove_index(i);
+                }
+            }
+        }
     }
 
     /// Sorts this map's entries in-place using `str`'s usual ordering.
@@ -379,6 +411,12 @@ impl Map<String, Value> {
     pub fn sort_keys(&mut self) {
         #[cfg(feature = "preserve_order")]
         self.map.sort_unstable_keys();
+    }
+
+    #[inline]
+    pub(crate) fn shrink_to_fit(&mut self) {
+        #[cfg(not(feature = "preserve_order"))]
+        self.map.shrink_to_fit();
     }
 }
 
@@ -455,7 +493,14 @@ where
     type Output = Value;
 
     fn index(&self, index: &Q) -> &Value {
-        self.map.index(index)
+        #[cfg(not(feature = "preserve_order"))]
+        {
+            self.map.get(index).expect("no entry found for key")
+        }
+        #[cfg(feature = "preserve_order")]
+        {
+            self.map.index(index)
+        }
     }
 }
 
@@ -483,7 +528,14 @@ where
 impl Debug for Map<String, Value> {
     #[inline]
     fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        self.map.fmt(formatter)
+        #[cfg(not(feature = "preserve_order"))]
+        {
+            formatter.debug_map().entries(self.iter()).finish()
+        }
+        #[cfg(feature = "preserve_order")]
+        {
+            self.map.fmt(formatter)
+        }
     }
 }
 
@@ -538,6 +590,7 @@ impl<'de> de::Deserialize<'de> for Map<String, Value> {
                     values.insert(key, value);
                 }
 
+                values.shrink_to_fit();
                 Ok(values)
             }
         }
@@ -638,12 +691,12 @@ pub struct OccupiedEntry<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type VacantEntryImpl<'a> = btree_map::VacantEntry<'a, String, Value>;
+type VacantEntryImpl<'a> = map::VacantEntry<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type VacantEntryImpl<'a> = indexmap::map::VacantEntry<'a, String, Value>;
 
 #[cfg(not(feature = "preserve_order"))]
-type OccupiedEntryImpl<'a> = btree_map::OccupiedEntry<'a, String, Value>;
+type OccupiedEntryImpl<'a> = map::OccupiedEntry<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type OccupiedEntryImpl<'a> = indexmap::map::OccupiedEntry<'a, String, Value>;
 
@@ -1062,7 +1115,7 @@ pub struct Iter<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type IterImpl<'a> = btree_map::Iter<'a, String, Value>;
+type IterImpl<'a> = map::Iter<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type IterImpl<'a> = indexmap::map::Iter<'a, String, Value>;
 
@@ -1088,7 +1141,7 @@ pub struct IterMut<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type IterMutImpl<'a> = btree_map::IterMut<'a, String, Value>;
+type IterMutImpl<'a> = map::IterMut<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type IterMutImpl<'a> = indexmap::map::IterMut<'a, String, Value>;
 
@@ -1114,7 +1167,7 @@ pub struct IntoIter {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type IntoIterImpl = btree_map::IntoIter<String, Value>;
+type IntoIterImpl = map::IntoIter<String, Value>;
 #[cfg(feature = "preserve_order")]
 type IntoIterImpl = indexmap::map::IntoIter<String, Value>;
 
@@ -1129,7 +1182,7 @@ pub struct Keys<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type KeysImpl<'a> = btree_map::Keys<'a, String, Value>;
+type KeysImpl<'a> = map::Keys<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type KeysImpl<'a> = indexmap::map::Keys<'a, String, Value>;
 
@@ -1144,7 +1197,7 @@ pub struct Values<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type ValuesImpl<'a> = btree_map::Values<'a, String, Value>;
+type ValuesImpl<'a> = map::Values<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type ValuesImpl<'a> = indexmap::map::Values<'a, String, Value>;
 
@@ -1159,7 +1212,7 @@ pub struct ValuesMut<'a> {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type ValuesMutImpl<'a> = btree_map::ValuesMut<'a, String, Value>;
+type ValuesMutImpl<'a> = map::ValuesMut<'a, String, Value>;
 #[cfg(feature = "preserve_order")]
 type ValuesMutImpl<'a> = indexmap::map::ValuesMut<'a, String, Value>;
 
@@ -1174,7 +1227,7 @@ pub struct IntoValues {
 }
 
 #[cfg(not(feature = "preserve_order"))]
-type IntoValuesImpl = btree_map::IntoValues<String, Value>;
+type IntoValuesImpl = map::IntoValues<String, Value>;
 #[cfg(feature = "preserve_order")]
 type IntoValuesImpl = indexmap::map::IntoValues<String, Value>;
 

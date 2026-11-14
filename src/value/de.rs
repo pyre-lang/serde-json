@@ -141,6 +141,7 @@ impl<'de> Deserialize<'de> for Value {
                             values.insert(key, value);
                         }
 
+                        values.shrink_to_fit();
                         Ok(Value::Object(values))
                     }
                     None => Ok(Value::Object(Map::new())),
